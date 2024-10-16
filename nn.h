@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <float.h>
 
+#include <immintrin.h>
+
 #include "arena.h"
 
 struct Matrix
@@ -30,10 +32,10 @@ struct Matrix
 
 inline Matrix* alloc_matrix(ArenaAllocator* arena, unsigned int row, unsigned int column)
 {
-    Matrix* mat = ARENA_ALLOC_ARRAY(arena, Matrix, 1);
+    Matrix* mat = ARENA_ALLOC_ALIGNTYPE(arena, Matrix, 1);
     mat->row = row;
     mat->column = column;
-    mat->data = ARENA_ALLOC_ARRAY(arena, float, row*column);
+    mat->data = ARENA_ALLOC_ALIGN16(arena, float, row*column);
     return mat;
 }
 
@@ -90,6 +92,56 @@ inline Matrix* matmul(ArenaAllocator* arena, const Matrix* A, const Matrix* B)
     return C;
 }
 
+inline Matrix* matmul_simd(ArenaAllocator* arena, const Matrix* A, Matrix* B)
+{
+    assert(arena != NULL && A != NULL && B != NULL);
+    assert(A->column == B->row);
+
+    Matrix* C = alloc_matrix(arena, A->row, B->column);
+
+    TEMP_ARENA_ALLOC_BEGIN(*arena);
+
+    transpose(arena, B);
+
+    for (unsigned int r = 0; r < C->row; r++)
+    {
+        for (unsigned int c = 0; c < C->column; c++)
+        {
+            const unsigned int block_count = A->column / 8; 
+            const unsigned int remain_count = A->column % 8;
+
+            for (unsigned int i = 0; i < block_count; i++)
+            {
+                __m256 va = _mm256_loadu_ps(&(A->data[r*A->column]));
+                __m256 vb = _mm256_loadu_ps(&(B->data[c*B->column]));
+
+                __m256 vc = _mm256_mul_ps(va, vb);
+
+                __m128 low_vc = _mm256_extractf128_ps(vc, 0);
+                __m128 high_vc = _mm256_extractf128_ps(vc, 1);
+
+                __m128 sum = _mm_add_ps(low_vc, high_vc);
+                sum = _mm_hadd_ps(sum, sum);
+                sum = _mm_hadd_ps(sum, sum);
+                C->at(r, c) = _mm_cvtss_f32(sum);
+            }
+
+            for (unsigned int i = block_count*8; i < A->column; i++)
+            {
+                float a = A->at(r, i);
+                float b = B->at(c, i);
+                C->at(r, c) += a*b;
+            }
+        }
+    }
+
+    transpose(arena, B);
+
+    TEMP_ARENA_ALLOC_END(*arena);
+
+    return C;
+}
+
 enum LayerType
 {
     LINEAR,
@@ -108,30 +160,31 @@ struct Linear
 
 inline Linear* alloc_linear(ArenaAllocator* arena, unsigned int in, unsigned int out, bool bias)
 {
-    Linear* layer = ARENA_ALLOC_ARRAY(arena, Linear, 1);
+    Linear* layer = ARENA_ALLOC_ALIGNTYPE(arena, Linear, 1);
     layer->in = in;
     layer->out = out;
 
     layer->weight.row = in;
     layer->weight.column = out;
-    layer->weight.data = ARENA_ALLOC_ARRAY(arena, float, layer->weight.row*layer->weight.column);
+    layer->weight.data = ARENA_ALLOC_ALIGN16(arena, float, layer->weight.row*layer->weight.column);
     
     if (bias)
     {
         layer->bias.row = 1;
         layer->bias.column = out;
-        layer->bias.data = ARENA_ALLOC_ARRAY(arena, float, layer->bias.row*layer->bias.column);
+        layer->bias.data = ARENA_ALLOC_ALIGN16(arena, float, layer->bias.row*layer->bias.column);
     }
 
     return layer;
 }
 
-inline Matrix* forward_linear(ArenaAllocator* arena, const Linear* layer, const Matrix* input)
+inline Matrix* forward_linear(ArenaAllocator* arena, Linear* layer, const Matrix* input)
 {
     assert(layer != NULL && input != NULL);
     assert(input->column == layer->weight.row);
 
-    Matrix* output = matmul(arena, input, &(layer->weight));
+    //Matrix* output = matmul(arena, input, &(layer->weight));
+    Matrix* output = matmul_simd(arena, input, &(layer->weight));
 
     if (layer->bias.row > 0 && layer->bias.column > 0)
     {
@@ -149,7 +202,7 @@ inline Matrix* forward_linear(ArenaAllocator* arena, const Linear* layer, const 
     return output;
 }
 
-inline Matrix* backward_linear(ArenaAllocator* arena, Linear* layer, Matrix* input, const Matrix* upstream, float learning_rate)
+inline Matrix* backward_linear(ArenaAllocator* arena, Linear* layer, Matrix* input, Matrix* upstream, float learning_rate)
 {
     assert(layer != NULL && input != NULL && upstream != NULL);
     assert(upstream->row == input->row);
@@ -160,14 +213,16 @@ inline Matrix* backward_linear(ArenaAllocator* arena, Linear* layer, Matrix* inp
 
     // dL/dX = dL/dY * W^T
     transpose(arena, &(layer->weight));
-    Matrix* dX = matmul(arena, upstream, &(layer->weight));
+    //Matrix* dX = matmul(arena, upstream, &(layer->weight));
+    Matrix* dX = matmul_simd(arena, upstream, &(layer->weight));
     transpose(arena, &(layer->weight));
 
     TEMP_ARENA_ALLOC_BEGIN(*arena)
     
     // dL/dW = X^T * dL/dY
     transpose(arena, input);
-    Matrix* dW = matmul(arena, input, upstream);
+    //Matrix* dW = matmul(arena, input, upstream);
+    Matrix* dW = matmul_simd(arena, input, upstream);
     transpose(arena, input);
 
     // gradient descent
@@ -319,12 +374,12 @@ struct NeuralNet
 
 NeuralNet* alloc_neural_net(ArenaAllocator* arena, unsigned int layer_size)
 {
-    NeuralNet* nn = ARENA_ALLOC_ARRAY(arena, NeuralNet, 1);
+    NeuralNet* nn = ARENA_ALLOC_ALIGNTYPE(arena, NeuralNet, 1);
     nn->layer_size = layer_size;
     nn->layer_count = 0;
-    nn->types = ARENA_ALLOC_ARRAY(arena, LayerType, layer_size);
-    nn->layers = ARENA_ALLOC_ARRAY(arena, void*, layer_size);
-    nn->inputs = ARENA_ALLOC_ARRAY(arena, Matrix*, layer_size+1);
+    nn->types = ARENA_ALLOC_ALIGNTYPE(arena, LayerType, layer_size);
+    nn->layers = ARENA_ALLOC_ALIGNTYPE(arena, void*, layer_size);
+    nn->inputs = ARENA_ALLOC_ALIGNTYPE(arena, Matrix*, layer_size+1);
     return nn;
 }
 

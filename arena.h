@@ -14,7 +14,8 @@
 
 #define PRINT_ARENA_USAGE(arena) printf("Arena memory usage: %f MB used, %f MB remain.\n", double((arena).offset) / (1024 * 1024), double((arena).size - (arena).offset) / (1024 * 1024));
 
-#define ARENA_ALLOC_ARRAY(arena, type, count) (type*)arena_alloc(arena, (count)*sizeof(type), alignof(type));
+#define ARENA_ALLOC_ALIGNTYPE(arena, type, count) (type*)arena_alloc(arena, (count)*sizeof(type), alignof(type));
+#define ARENA_ALLOC_ALIGN16(arena, type, count) (type*)arena_alloc(arena, (count)*sizeof(type), 16);
 
 bool is_power_of_two(uintptr_t x)
 {

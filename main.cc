@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 
+#include <immintrin.h>
+
 #define MNIST_TRAIN_LABELS_FILE "mnist/train-labels.idx1-ubyte"
 #define MNIST_TRAIN_IMAGES_FILE "mnist/train-images.idx3-ubyte"
 #define MNIST_TEST_LABELS_FILE "mnist/t10k-labels.idx1-ubyte"
@@ -24,7 +26,8 @@ int mnist_read_int(FILE* fp)
 int main(int argc, char** argv)
 {
     size_t buffer_size = MB(64);
-    void* buffer = malloc(buffer_size);
+    //void* buffer = malloc(buffer_size);
+    void* buffer = _mm_malloc(buffer_size, 16);
     ArenaAllocator arena;
     arena_init(&arena, buffer, buffer_size);
 
@@ -67,8 +70,7 @@ int main(int argc, char** argv)
 
     TEMP_ARENA_ALLOC_BEGIN(arena);
 
-    unsigned char* train_images = 
-        (unsigned char*)arena_alloc(&arena, train_image_number*train_image_size*sizeof(unsigned char), alignof(unsigned char));
+    unsigned char* train_images = ARENA_ALLOC_ALIGN16(&arena, unsigned char, train_image_number*train_image_size);
     read_bytes = fread(train_images, sizeof(unsigned char), train_image_number*train_image_size, train_image_fp);
     assert(read_bytes == train_image_number*train_image_size*sizeof(unsigned char));
     fclose(train_image_fp);
@@ -76,7 +78,7 @@ int main(int argc, char** argv)
     printf("MNIST train images loaded, image row: %d, image column: %d, total number: %d\n", train_image_row, train_image_column, train_image_number);
     PRINT_ARENA_USAGE(arena);
 
-    unsigned char* train_labels = (unsigned char*)arena_alloc(&arena, train_label_number*sizeof(unsigned char), alignof(unsigned char));
+    unsigned char* train_labels = ARENA_ALLOC_ALIGN16(&arena, unsigned char, train_label_number);
     read_bytes = fread(train_labels, sizeof(unsigned char), train_label_number, train_label_fp);
     assert(read_bytes == train_label_number*sizeof(unsigned char));
     fclose(train_label_fp);
@@ -91,7 +93,7 @@ int main(int argc, char** argv)
 
     printf("training setting: learning rate %f, total epochs %d, mini batch size %d\n", learning_rate, total_epochs, mini_batch_size);
 
-    int* train_index = (int*)arena_alloc(&arena, train_image_number*sizeof(int), alignof(int));
+    int* train_index = ARENA_ALLOC_ALIGNTYPE(&arena, int, train_image_number);
     for (int i = 0; i < train_image_number; i++)
     {
         train_index[i] = i;
@@ -117,26 +119,35 @@ int main(int argc, char** argv)
 
             printf("At epoch %d train %d: \n", e, t);
 
-            Matrix* input = (Matrix*)arena_alloc(&arena, sizeof(Matrix), alignof(Matrix));
-            input->row = mini_batch_size;
-            input->column = train_image_size;
-            input->data = (float*)arena_alloc(&arena, input->row*input->column*sizeof(float), alignof(float));
+            Matrix* input = alloc_matrix(&arena, mini_batch_size, train_image_size);
 
+            const float max_pixel_value = 255;
+            __m256 vmax_pixel_value = _mm256_broadcast_ss(&max_pixel_value);
             for (unsigned int r = 0; r < input->row; r++)
             {
                 int image_index = train_index[t*mini_batch_size + r];
                 int image_data_offset = image_index*train_image_size*sizeof(unsigned char);
-                for (unsigned int c = 0; c < input->column; c++)
+
+                const unsigned int block_count = input->column / 8; 
+                const unsigned int remain_count = input->column % 8;
+
+                for (unsigned int i = 0; i < block_count; i++)
                 {
-                    unsigned char pixel = train_images[image_data_offset + c];
-                    input->at(r, c) = pixel / 255.f;
+                    __m128i* pixel = (__m128i*)(&train_images[image_data_offset + i*8]);
+                    __m256i iinput = _mm256_cvtepu8_epi32(*pixel);
+                    __m256 finput = _mm256_cvtepi32_ps(iinput);
+                    __m256 normalize_input = _mm256_div_ps(finput, vmax_pixel_value);
+                    _mm256_storeu_ps(&(input->data[r*input->column + i*8]), normalize_input);
+                }
+
+                for (unsigned int i = block_count*8; i < input->column; i++)
+                {
+                    unsigned char pixel = train_images[image_data_offset + i];
+                    input->data[r*input->column + i] = pixel / 255.0f;
                 }
             }
 
-            Matrix* target = (Matrix*)arena_alloc(&arena, sizeof(Matrix), alignof(Matrix));
-            target->row = input->row;
-            target->column = 10;
-            target->data = (float*)arena_alloc(&arena, target->row*target->column*sizeof(float), alignof(float));
+            Matrix* target = alloc_matrix(&arena, input->row, 10);
 
             for (unsigned int r = 0; r < target->row; r++)
             {
