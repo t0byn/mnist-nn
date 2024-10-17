@@ -110,12 +110,12 @@ inline Matrix* matmul_simd(ArenaAllocator* arena, const Matrix* A, Matrix* B)
             const unsigned int block_count = A->column / 8; 
             const unsigned int remain_count = A->column % 8;
 
+            const __m256* va = (__m256*)(&(A->data[r*A->column]));
+            const __m256* vb = (__m256*)(&(B->data[c*B->column]));
+
             for (unsigned int i = 0; i < block_count; i++)
             {
-                __m256 va = _mm256_loadu_ps(&(A->data[r*A->column]));
-                __m256 vb = _mm256_loadu_ps(&(B->data[c*B->column]));
-
-                __m256 vc = _mm256_mul_ps(va, vb);
+                __m256 vc = _mm256_mul_ps(va[i], vb[i]);
 
                 __m128 low_vc = _mm256_extractf128_ps(vc, 0);
                 __m128 high_vc = _mm256_extractf128_ps(vc, 1);
@@ -123,7 +123,7 @@ inline Matrix* matmul_simd(ArenaAllocator* arena, const Matrix* A, Matrix* B)
                 __m128 sum = _mm_add_ps(low_vc, high_vc);
                 sum = _mm_hadd_ps(sum, sum);
                 sum = _mm_hadd_ps(sum, sum);
-                C->at(r, c) = _mm_cvtss_f32(sum);
+                C->at(r, c) += _mm_cvtss_f32(sum);
             }
 
             for (unsigned int i = block_count*8; i < A->column; i++)
