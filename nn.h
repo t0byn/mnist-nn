@@ -191,10 +191,22 @@ inline Matrix* forward_linear(ArenaAllocator* arena, Linear* layer, const Matrix
         assert(layer->bias.row == 1 && layer->bias.column == output->column);
         for (unsigned int r = 0; r < output->row; r++)
         {
-            for (unsigned int c = 0; c < output->column; c++)
+            const unsigned int block_count = output->column / 8;
+            const unsigned int remain_count = output->column % 8;
+
+            __m256* voutput = (__m256*)(&output->data[r*output->column]);
+            __m256* vbias = (__m256*)(layer->bias.data);
+
+            for (unsigned int i = 0; i < block_count; i++)
             {
-                float b = layer->bias.at(0, c);
-                output->at(r, c) += b;
+                __m256 result = _mm256_add_ps(voutput[i], vbias[i]);
+                _mm256_storeu_ps((float*)&voutput[i], result);
+            }
+
+            for (unsigned int i = block_count*8; i < output->column; i++)
+            {
+                float b = layer->bias.at(0, i);
+                output->at(r, i) += b;
             }
         }
     }
@@ -209,7 +221,9 @@ inline Matrix* backward_linear(ArenaAllocator* arena, Linear* layer, Matrix* inp
     assert(upstream->column == layer->weight.column);
     assert(input->column == layer->weight.row);
 
-    float factor = 1.f/input->row;
+    const float factor = -1.0f/input->row;
+    const float lrate = learning_rate*factor;
+    __m256 vlrate = _mm256_broadcast_ss(&lrate);
 
     // dL/dX = dL/dY * W^T
     transpose(arena, &(layer->weight));
@@ -226,11 +240,24 @@ inline Matrix* backward_linear(ArenaAllocator* arena, Linear* layer, Matrix* inp
     transpose(arena, input);
 
     // gradient descent
-    for (unsigned int r = 0; r < dW->row; r++)
     {
-        for (unsigned int c = 0; c < dW->column; c++)
+        unsigned int total = dW->row*dW->column;
+
+        unsigned int block_count = total / 8;
+        unsigned int remain_count = total % 8;
+
+        __m256* vweight = (__m256*)(layer->weight.data);
+        __m256* vgrad = (__m256*)(dW->data);
+
+        for (unsigned int i = 0; i < block_count; i++)
         {
-            layer->weight.at(r, c) -= dW->at(r, c)*learning_rate*factor;
+            __m256 vresult = _mm256_fmadd_ps(vgrad[i], vlrate, vweight[i]);
+            _mm256_storeu_ps((float*)&vweight[i], vresult);
+        }
+
+        for (unsigned int i = block_count*8; i < total; i++)
+        {
+            layer->weight.data[i] += dW->data[i] * lrate;
         }
     }
 
@@ -273,14 +300,32 @@ inline Matrix* forward_sigmoid(ArenaAllocator* arena, const Sigmoid* layer, cons
 
     Matrix* output = alloc_matrix(arena, input->row, input->column);
 
-    for (unsigned int r = 0; r < input->row; r++)
+    unsigned int total = input->row*input->column;
+
+    for (unsigned int i = 0; i < total; i++)
     {
-        for (unsigned int c = 0; c < input->column; c++)
-        {
-            float x = input->at(r, c);
-            float s = 1.f / (1.f + expf(-x));
-            output->at(r, c) = s;
-        }
+        output->data[i] = expf(-input->data[i]);
+    }
+
+    const float c1 = 1.0f;
+    __m256 v1 = _mm256_broadcast_ss(&c1);
+
+    unsigned int block_count = total / 8;
+    unsigned int remain_count = total % 8;
+
+    __m256* voutput = (__m256*)(output->data);
+
+    for (unsigned int i = 0; i < block_count; i++)
+    {
+        __m256 vtemp = _mm256_add_ps(v1, voutput[i]);
+        __m256 vresult = _mm256_div_ps(v1, vtemp);
+        _mm256_storeu_ps((float*)&voutput[i], vresult);
+    }
+
+    for (unsigned int i = block_count*8; i < total; i++)
+    {
+        float s = 1.0f / (1.0f + output->data[i]);
+        output->data[i] = s;
     }
 
     return output;
@@ -328,11 +373,27 @@ inline float forward_mseloss(ArenaAllocator* arena, const MSELoss* layer, const 
     assert(input->column == target->column);
 
     float sum = 0.f;
-    for (unsigned int r = 0; r < input->row; r++)
     {
-        for (unsigned int c = 0; c < input->column; c++)
+        unsigned int total = input->row*input->column;
+        unsigned int block_count = total / 8;
+        unsigned int remain_count = total % 8;
+
+        __m256* vinput = (__m256*)input->data;
+        __m256* vtarget = (__m256*)target->data;
+
+        for (unsigned int i = 0; i < block_count; i++)
         {
-            float error = target->at(r, c) - input->at(r, c);
+            __m256 verror = _mm256_sub_ps(vtarget[i], vinput[i]);
+            verror = _mm256_mul_ps(verror, verror);
+            __m128 vsum = _mm_hadd_ps(_mm256_extractf128_ps(verror, 0), _mm256_extractf128_ps(verror, 1));
+            vsum = _mm_hadd_ps(vsum, vsum);
+            vsum = _mm_hadd_ps(vsum, vsum);
+            sum += _mm_cvtss_f32(vsum);
+        }
+
+        for (unsigned int i = block_count*8; i < total; i++)
+        {
+            float error = target->data[i] - input->data[i];
             sum += error*error;
         }
     }
@@ -349,13 +410,27 @@ inline Matrix* backward_mseloss(ArenaAllocator* arena, const MSELoss* layer, con
 
     Matrix* dY = alloc_matrix(arena, input->row, input->column);
 
-    float two_over_n = 2.f / float(input->row);
-    for (unsigned int r = 0; r < input->row; r++)
+    const float two_over_n = 2.f / float(input->row);
     {
-        for (unsigned int c = 0; c < input->column; c++)
+        unsigned int total = input->row*input->column;
+        unsigned int block_count = total / 8;
+        unsigned int remain_count = total % 8;
+
+        __m256* vinput = (__m256*)input->data;
+        __m256* vtarget = (__m256*)target->data;
+        __m256 vfactor = _mm256_broadcast_ss(&two_over_n);
+
+        for (unsigned int i = 0; i < block_count; i++)
         {
-            float dLdY = two_over_n*(input->at(r, c) - target->at(r, c));
-            dY->at(r, c) = dLdY;
+            __m256 verror = _mm256_sub_ps(vinput[i], vtarget[i]);
+            __m256 vdY = _mm256_mul_ps(verror, vfactor);
+            _mm256_storeu_ps(&dY->data[i*8], vdY);
+        }
+
+        for (unsigned int i = block_count*8; i < total; i++)
+        {
+            float dLdY = two_over_n*(input->data[i] - target->data[i]);
+            dY->data[i] = dLdY;
         }
     }
 

@@ -78,7 +78,7 @@ int main(int argc, char** argv)
     printf("MNIST train images loaded, image row: %d, image column: %d, total number: %d\n", train_image_row, train_image_column, train_image_number);
     PRINT_ARENA_USAGE(arena);
 
-    unsigned char* train_labels = ARENA_ALLOC_ALIGN16(&arena, unsigned char, train_label_number);
+    unsigned char* train_labels = ARENA_ALLOC_ALIGNTYPE(&arena, unsigned char, train_label_number);
     read_bytes = fread(train_labels, sizeof(unsigned char), train_label_number, train_label_fp);
     assert(read_bytes == train_label_number*sizeof(unsigned char));
     fclose(train_label_fp);
@@ -166,7 +166,7 @@ int main(int argc, char** argv)
             TEMP_ARENA_ALLOC_END(arena);
         }
     }
-    
+
     TEMP_ARENA_ALLOC_END(arena);
 
     FILE* test_label_fp = fopen(MNIST_TEST_LABELS_FILE, "rb");
@@ -188,8 +188,7 @@ int main(int argc, char** argv)
 
     TEMP_ARENA_ALLOC_BEGIN(arena);
 
-    unsigned char* test_images = 
-        (unsigned char*)arena_alloc(&arena, test_image_number*test_image_size*sizeof(unsigned char), alignof(unsigned char));
+    unsigned char* test_images = ARENA_ALLOC_ALIGNTYPE(&arena, unsigned char, test_image_number*test_image_size);
     read_bytes = fread(test_images, sizeof(unsigned char), test_image_number*test_image_size, test_image_fp);
     assert(read_bytes == test_image_number*test_image_size*sizeof(unsigned char));
     fclose(test_image_fp);
@@ -197,7 +196,7 @@ int main(int argc, char** argv)
     printf("MNIST test images loaded, image row: %d, image column: %d, total number: %d\n", test_image_row, test_image_column, test_image_number);
     PRINT_ARENA_USAGE(arena);
 
-    unsigned char* test_labels = (unsigned char*)arena_alloc(&arena, test_label_number*sizeof(unsigned char), alignof(unsigned char));
+    unsigned char* test_labels = ARENA_ALLOC_ALIGNTYPE(&arena, unsigned char, test_label_number);
     read_bytes = fread(test_labels, sizeof(unsigned char), test_label_number, test_label_fp);
     assert(read_bytes == test_label_number*sizeof(unsigned char));
     fclose(test_label_fp);
@@ -213,10 +212,7 @@ int main(int argc, char** argv)
 
         TEMP_ARENA_ALLOC_BEGIN(arena);
 
-        Matrix* input = (Matrix*)arena_alloc(&arena, sizeof(Matrix), alignof(Matrix));
-        input->row = 1;
-        input->column = test_image_size;
-        input->data = (float*)arena_alloc(&arena, input->row*input->column*sizeof(float), alignof(float));
+        Matrix* input = alloc_matrix(&arena, 1, test_image_size);
         int image_data_offset = i*test_image_size;
         for (int j = 0; j < test_image_size; j++)
         {
@@ -224,11 +220,7 @@ int main(int argc, char** argv)
             input->at(0, j) = pixel;
         }
 
-        Matrix* target = (Matrix*)arena_alloc(&arena, sizeof(Matrix), alignof(Matrix));
-        target->row = input->row;
-        target->column = 10;
-        target->data = (float*)arena_alloc(&arena, target->row*target->column*sizeof(float), alignof(float));
-        
+        Matrix* target = alloc_matrix(&arena, input->row, 10);
         int label_data_offset = i*sizeof(unsigned char);
         unsigned char label = test_labels[label_data_offset];
         assert(label < target->column);
